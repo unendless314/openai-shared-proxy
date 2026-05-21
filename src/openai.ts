@@ -38,6 +38,11 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
     delete body.max_tokens;
   }
 
+  // Drop client-side framework specific parameters that OpenAI doesn't natively support
+  if (body.reasoningSummary !== undefined) {
+    delete body.reasoningSummary;
+  }
+
   const isStream = body.stream === true;
 
   // For streaming, inject stream_options to get usage details at the end
