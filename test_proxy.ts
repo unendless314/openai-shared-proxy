@@ -31,13 +31,17 @@ mockApp.post('/v1/chat/completions', (req, res) => {
   // Simulate failures if state.mockErrorStatus is set
   if (state.mockErrorStatus) {
     console.log(`[Mock Upstream] Simulating configured failure: HTTP ${state.mockErrorStatus}`);
-    res.status(state.mockErrorStatus).json({
-      error: {
-        message: state.mockErrorText,
-        type: 'mock_error',
-        code: 'mock_failure'
-      }
-    });
+    if (state.mockErrorText.startsWith('<') || state.mockErrorText.includes('Gateway') || state.mockErrorText.includes('key')) {
+      res.status(state.mockErrorStatus).send(state.mockErrorText);
+    } else {
+      res.status(state.mockErrorStatus).json({
+        error: {
+          message: state.mockErrorText,
+          type: 'mock_error',
+          code: 'mock_failure'
+        }
+      });
+    }
     return;
   }
 
@@ -205,6 +209,83 @@ async function runTests() {
     // Reset mock server to operational status
     state.mockErrorStatus = null;
 
+    // Wait for cooldowns to reset before testing 4a
+    console.log('Waiting 2 seconds for cooldowns to clear...');
+    await sleep(2000);
+
+    console.log('\n--- 🧪 TEST 4a: Non-JSON Upstream Error Handling ---');
+    state.mockErrorStatus = 502;
+    state.mockErrorText = 'Bad Gateway';
+
+    const nonJsonResp = await fetch('http://127.0.0.1:3001/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer test-proxy-token'
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'test non-json' }] })
+    });
+
+    console.log(`Non-JSON status: ${nonJsonResp.status} (Expected: 502)`);
+    const nonJsonData = await nonJsonResp.json() as any;
+    console.log(`Response structure:`, JSON.stringify(nonJsonData));
+    if (!nonJsonData.error || !nonJsonData.error.message || !nonJsonData.error.message.includes('Bad Gateway')) {
+      throw new Error('Non-JSON error fallback did not return standard error payload!');
+    }
+    console.log('✅ Standard error payload returned successfully!');
+    state.mockErrorStatus = null;
+
+    // Wait for cooldowns to reset before testing 4b
+    console.log('Waiting 2 seconds for cooldowns to clear...');
+    await sleep(2000);
+
+    console.log('\n--- 🧪 TEST 4b: 401 Permanent Disabling ---');
+    // Set mock server to return 401 Unauthorized
+    state.mockErrorStatus = 401;
+    state.mockErrorText = 'Invalid API key';
+
+    const authFailResp2 = await fetch('http://127.0.0.1:3001/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer test-proxy-token'
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'trigger 401' }] })
+    });
+
+    console.log(`401 response status: ${authFailResp2.status} (Expected: 401)`);
+    state.mockErrorStatus = null; // Restore mock server to normal
+
+    // Wait a tiny bit for DB to update
+    await sleep(200);
+
+    // The first free key (sk-free-key-1) should now be permanently disabled.
+    // Let's verify by sending a successful request. It should route to sk-free-key-2 instead of sk-free-key-1!
+    const routeCheckResp = await fetch('http://127.0.0.1:3001/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer test-proxy-token'
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'check routed key' }] })
+    });
+
+    console.log(`Route check status: ${routeCheckResp.status} (Expected: 200)`);
+    const routedKeyType = routeCheckResp.headers.get('X-Proxy-Upstream-Key-Type');
+    console.log(`Routed to key type: ${routedKeyType} (Expected: free)`);
+    
+    // We should fetch status details to verify that one of the keys is indeed marked as isDisabled: true
+    const basicAuthCheck = Buffer.from('admin:adminpass').toString('base64');
+    const adminCheckResp = await fetch('http://127.0.0.1:3001/api/status', {
+      headers: { 'Authorization': `Basic ${basicAuthCheck}` }
+    });
+    const checkData = await adminCheckResp.json() as any;
+    const disabledKey = checkData.upstreamKeys.find((k: any) => k.isDisabled === true);
+    if (!disabledKey) {
+      throw new Error('Key was not marked as permanently disabled in database after 401!');
+    }
+    console.log(`✅ Verified key ${disabledKey.label} was permanently disabled!`);
+
     console.log('\n--- 🧪 TEST 5: Admin API Stats & HTML Dashboard ---');
     const basicAuth = Buffer.from('admin:adminpass').toString('base64');
     const adminApiResp = await fetch('http://127.0.0.1:3001/api/status', {
@@ -217,8 +298,13 @@ async function runTests() {
     const adminData = await adminApiResp.json() as any;
     console.log('Retrieved key states from DB:');
     adminData.upstreamKeys.forEach((key: any) => {
-      console.log(`- Key label: ${key.label}, Type: ${key.keyType}, Healthy: ${key.healthy}, Cooldown: ${key.cooldownUntil !== null}, Errors: ${key.lastError}`);
+      console.log(`- Key label: ${key.label}, Type: ${key.keyType}, Healthy: ${key.healthy}, Cooldown: ${key.cooldownUntil !== null}, Disabled: ${key.isDisabled}, Errors: ${key.lastError}`);
     });
+
+    if (adminData.usageEstimate.inputTokens === undefined || adminData.usageEstimate.outputTokens === undefined) {
+      throw new Error('API status usageEstimate is missing inputTokens or outputTokens splits!');
+    }
+    console.log(`Verified usageEstimate splits: inputTokens = ${adminData.usageEstimate.inputTokens}, outputTokens = ${adminData.usageEstimate.outputTokens}`);
 
     // Check HTML Dashboard
     const adminHtmlResp = await fetch('http://127.0.0.1:3001/status', {

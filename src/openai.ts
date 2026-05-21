@@ -119,7 +119,8 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
       }
 
       // Propagate the upstream error back to client
-      res.status(response.status).json(errorJson || {
+      const hasErrorStructure = errorJson && typeof errorJson === 'object' && errorJson.error;
+      res.status(response.status).json(hasErrorStructure ? errorJson : {
         error: {
           message: errorMsg,
           type: 'upstream_error',
@@ -207,7 +208,7 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
         keyType: selectedKey.type
       });
 
-      updateDailyUsage(selectedKey.hash, finalInputTokens + finalOutputTokens);
+      updateDailyUsage(selectedKey.hash, finalInputTokens, finalOutputTokens);
 
     } else {
       // 4. NON-STREAMING FLOW
@@ -237,7 +238,7 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
         keyType: selectedKey.type
       });
 
-      updateDailyUsage(selectedKey.hash, promptTokens + completionTokens);
+      updateDailyUsage(selectedKey.hash, promptTokens || 0, completionTokens || 0);
     }
 
   } catch (error: any) {

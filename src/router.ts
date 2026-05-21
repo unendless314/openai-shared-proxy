@@ -1,5 +1,5 @@
 import { config } from './config.js';
-import { getKeyState, getDailyUsage, setCooldown, setExhausted, clearKeyError, hashKey } from './db.js';
+import { getKeyState, getDailyUsage, setCooldown, setExhausted, clearKeyError, hashKey, setDisabled } from './db.js';
 
 export interface SelectedKey {
   key: string;
@@ -34,6 +34,11 @@ export function selectNextKey(): SelectedKey {
       // Check health and cooldown
       const isCooldown = state.cooldownUntil > now;
       const isExhausted = state.exhaustedUntil > now;
+      const isDisabled = state.isDisabled;
+
+      if (isDisabled) {
+        continue; // Skip this key, try the next one
+      }
 
       // Check daily limits
       const isTokenExceeded = usage.tokensEstimated >= config.keyDailyTokenLimit;
@@ -71,8 +76,11 @@ export function selectNextKey(): SelectedKey {
     const state = getKeyState(hash, 'master');
 
     const isCooldown = state.cooldownUntil > now;
+    const isDisabled = state.isDisabled;
 
-    if (!isCooldown) {
+    if (isDisabled) {
+      console.error(`❌ Paid Master Key is permanently disabled.`);
+    } else if (!isCooldown) {
       console.log(`ℹ️ All free keys exhausted or cooling down. Falling back to Paid Master Key.`);
       return {
         key,
@@ -89,19 +97,19 @@ export function selectNextKey(): SelectedKey {
 }
 
 export function handleKeyFailure(keyHash: string, keyType: 'free' | 'master', errorStatus: number, errorMessage: string) {
-  // If it's an auth error (401), mark it as permanently cooling down (large number) or marked as an active bad error
-  // For transient errors, mark a standard cooldown
   const isAuthError = errorStatus === 401;
-  const cooldownDuration = isAuthError 
-    ? 24 * 60 * 60 * 1000 // 24 hours for invalid key
-    : config.keyCooldownMs; // Standard 60s cooldown
-
   const formattedMsg = isAuthError 
     ? `Invalid Credentials (401): ${errorMessage}` 
     : `HTTP ${errorStatus}: ${errorMessage}`;
 
-  console.warn(`⚠️ Key ${keyHash.substring(0, 8)} failed. Action: Cooldown for ${cooldownDuration / 1000}s. Error: ${formattedMsg}`);
-  setCooldown(keyHash, keyType, cooldownDuration, formattedMsg);
+  if (isAuthError) {
+    console.error(`❌ CRITICAL: Key ${keyHash.substring(0, 8)} failed due to invalid credentials (401). Disabling key permanently.`);
+    setDisabled(keyHash, keyType, formattedMsg);
+  } else {
+    const cooldownDuration = config.keyCooldownMs; // Standard cooldown
+    console.warn(`⚠️ Key ${keyHash.substring(0, 8)} failed. Action: Cooldown for ${cooldownDuration / 1000}s. Error: ${formattedMsg}`);
+    setCooldown(keyHash, keyType, cooldownDuration, formattedMsg);
+  }
 }
 
 export function handleKeySuccess(keyHash: string, keyType: 'free' | 'master') {

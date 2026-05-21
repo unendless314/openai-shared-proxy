@@ -12,6 +12,8 @@ function escapeHtml(unsafe: string): string {
 interface UsageToday {
   requests: number;
   tokens: number;
+  inputTokens: number;
+  outputTokens: number;
 }
 
 interface UpstreamKeyInfo {
@@ -21,6 +23,7 @@ interface UpstreamKeyInfo {
   healthy: boolean;
   cooldownUntil: string | null;
   exhaustedUntil: string | null;
+  isDisabled: boolean;
   lastError: string | null;
   lastSuccessAt: string | null;
   usageToday: UsageToday;
@@ -29,7 +32,7 @@ interface UpstreamKeyInfo {
 interface StatusDetails {
   service: { ok: boolean; uptimeSec: number };
   upstreamKeys: UpstreamKeyInfo[];
-  usageEstimate: { dateUtc: string; requests: number; tokens: number };
+  usageEstimate: { dateUtc: string; requests: number; tokens: number; inputTokens: number; outputTokens: number };
 }
 
 // Helper to format uptime into human-readable string
@@ -65,7 +68,13 @@ export function renderDashboard(details: StatusDetails): string {
     let pulseClass = 'pulse-green';
     let alertDetails = '';
 
-    if (key.exhaustedUntil) {
+    if (key.isDisabled) {
+      statusLabel = 'Disabled';
+      statusClass = 'badge-danger';
+      pulseClass = 'pulse-red';
+      const safeError = key.lastError ? escapeHtml(key.lastError) : 'Permanently disabled due to invalid credentials (401)';
+      alertDetails = `<div class="key-alert danger">Disabled: ${safeError}</div>`;
+    } else if (key.exhaustedUntil) {
       statusLabel = 'Exhausted';
       statusClass = 'badge-exhausted';
       pulseClass = 'pulse-orange';
@@ -88,14 +97,14 @@ export function renderDashboard(details: StatusDetails): string {
 
     // Token Progress Bar calculations
     const tokenCap = isFree ? tokenLimit : Infinity;
-    const tokenVal = key.usageToday.tokens;
+    const tokenVal = key.usageToday.tokens || 0;
     const tokenPercent = tokenCap === Infinity ? 0 : Math.min(100, (tokenVal / tokenCap) * 100);
     const tokenDisplay = tokenCap === Infinity ? `${tokenVal.toLocaleString()} (No Cap)` : `${tokenVal.toLocaleString()} / ${tokenCap.toLocaleString()}`;
     const tokenProgressClass = tokenPercent > 80 ? 'progress-danger' : tokenPercent > 50 ? 'progress-warning' : 'progress-success';
 
     // Request Progress Bar calculations
     const reqCap = isFree ? reqLimit : Infinity;
-    const reqVal = key.usageToday.requests;
+    const reqVal = key.usageToday.requests || 0;
     const reqPercent = reqCap === Infinity ? 0 : Math.min(100, (reqVal / reqCap) * 100);
     const reqDisplay = reqCap === Infinity ? `${reqVal.toLocaleString()} (No Cap)` : `${reqVal.toLocaleString()} / ${reqCap.toLocaleString()}`;
     const reqProgressClass = reqPercent > 80 ? 'progress-danger' : reqPercent > 50 ? 'progress-warning' : 'progress-success';
@@ -749,11 +758,11 @@ export function renderDashboard(details: StatusDetails): string {
       <div class="config-grid">
         <div class="config-item">
           <span class="config-item-label">Upstream Endpoint</span>
-          <span class="config-item-value">${config.openaiBaseUrl}</span>
+          <span class="config-item-value">${escapeHtml(config.openaiBaseUrl)}</span>
         </div>
         <div class="config-item">
           <span class="config-item-label">Default Target Model</span>
-          <span class="config-item-value">${config.openaiDefaultModel}</span>
+          <span class="config-item-value">${escapeHtml(config.openaiDefaultModel)}</span>
         </div>
         <div class="config-item">
           <span class="config-item-label">Free Key Token Limit</span>
@@ -777,7 +786,7 @@ export function renderDashboard(details: StatusDetails): string {
         </div>
         <div class="config-item">
           <span class="config-item-label">SQLite Database Path</span>
-          <span class="config-item-value">${config.sqlitePath}</span>
+          <span class="config-item-value">${escapeHtml(config.sqlitePath)}</span>
         </div>
         <div class="config-item">
           <span class="config-item-label">Pruning Policy</span>
@@ -876,7 +885,12 @@ export function renderDashboard(details: StatusDetails): string {
             let pulseClass = 'pulse-indicator pulse-green';
             let alertHtml = '';
 
-            if (key.exhaustedUntil) {
+            if (key.isDisabled) {
+              statusLabel = 'Disabled';
+              statusClass = 'badge badge-danger';
+              pulseClass = 'pulse-indicator pulse-red';
+              alertHtml = '<div class="key-alert danger">Disabled: ' + escapeHtml(key.lastError || 'Permanently disabled due to invalid credentials (401)') + '</div>';
+            } else if (key.exhaustedUntil) {
               const resTime = new Date(key.exhaustedUntil).getTime();
               const timeRemaining = Math.max(0, Math.round((resTime - now) / 1000 / 60));
               statusLabel = 'Exhausted';

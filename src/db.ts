@@ -21,6 +21,7 @@ export interface KeyState {
   exhaustedUntil: number;
   lastError: string | null;
   lastSuccessAt: string | null;
+  isDisabled: boolean;
 }
 
 export interface DailyUsage {
@@ -28,6 +29,8 @@ export interface DailyUsage {
   upstreamKeyHash: string;
   requestsCount: number;
   tokensEstimated: number;
+  inputTokensEstimated: number;
+  outputTokensEstimated: number;
 }
 
 // Generate a safe hash for an API key to identify it without exposing it
@@ -64,7 +67,8 @@ export function initDb() {
       cooldown_until INTEGER DEFAULT 0,
       exhausted_until INTEGER DEFAULT 0,
       last_error TEXT,
-      last_success_at TEXT
+      last_success_at TEXT,
+      is_disabled INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS daily_usage_estimate (
@@ -72,11 +76,38 @@ export function initDb() {
       upstream_key_hash TEXT,
       requests_count INTEGER DEFAULT 0,
       tokens_estimated INTEGER DEFAULT 0,
+      input_tokens_estimated INTEGER DEFAULT 0,
+      output_tokens_estimated INTEGER DEFAULT 0,
       PRIMARY KEY (date_utc, upstream_key_hash)
     );
 
     CREATE INDEX IF NOT EXISTS idx_req_log_created ON request_log (created_at);
   `);
+
+  // Run dynamic schema migrations for existing databases
+  try {
+    db.exec(`ALTER TABLE upstream_key_state ADD COLUMN is_disabled INTEGER DEFAULT 0`);
+  } catch (err: any) {
+    if (!err.message.includes('duplicate column name')) {
+      console.error('Failed to migrate upstream_key_state (is_disabled):', err);
+    }
+  }
+
+  try {
+    db.exec(`ALTER TABLE daily_usage_estimate ADD COLUMN input_tokens_estimated INTEGER DEFAULT 0`);
+  } catch (err: any) {
+    if (!err.message.includes('duplicate column name')) {
+      console.error('Failed to migrate daily_usage_estimate (input_tokens_estimated):', err);
+    }
+  }
+
+  try {
+    db.exec(`ALTER TABLE daily_usage_estimate ADD COLUMN output_tokens_estimated INTEGER DEFAULT 0`);
+  } catch (err: any) {
+    if (!err.message.includes('duplicate column name')) {
+      console.error('Failed to migrate daily_usage_estimate (output_tokens_estimated):', err);
+    }
+  }
 
   console.log('✅ SQLite database initialized successfully.');
 
@@ -123,17 +154,23 @@ export function logRequest(log: RequestLog) {
   }
 }
 
-export function updateDailyUsage(keyHash: string, tokens: number) {
+export function updateDailyUsage(keyHash: string, inputTokens: number, outputTokens: number) {
   try {
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD in UTC
+    const totalTokens = inputTokens + outputTokens;
     const stmt = db.prepare(`
-      INSERT INTO daily_usage_estimate (date_utc, upstream_key_hash, requests_count, tokens_estimated)
-      VALUES (?, ?, 1, ?)
+      INSERT INTO daily_usage_estimate (
+        date_utc, upstream_key_hash, requests_count, tokens_estimated,
+        input_tokens_estimated, output_tokens_estimated
+      )
+      VALUES (?, ?, 1, ?, ?, ?)
       ON CONFLICT(date_utc, upstream_key_hash) DO UPDATE SET
         requests_count = requests_count + 1,
-        tokens_estimated = tokens_estimated + ?
+        tokens_estimated = tokens_estimated + ?,
+        input_tokens_estimated = input_tokens_estimated + ?,
+        output_tokens_estimated = output_tokens_estimated + ?
     `);
-    stmt.run(today, keyHash, tokens, tokens);
+    stmt.run(today, keyHash, totalTokens, inputTokens, outputTokens, totalTokens, inputTokens, outputTokens);
   } catch (error) {
     console.error('❌ Failed to update daily usage in SQLite:', error);
   }
@@ -143,7 +180,8 @@ export function getDailyUsage(keyHash: string): DailyUsage {
   try {
     const today = new Date().toISOString().split('T')[0];
     const stmt = db.prepare(`
-      SELECT date_utc, upstream_key_hash, requests_count, tokens_estimated
+      SELECT date_utc, upstream_key_hash, requests_count, tokens_estimated,
+             input_tokens_estimated, output_tokens_estimated
       FROM daily_usage_estimate
       WHERE date_utc = ? AND upstream_key_hash = ?
     `);
@@ -154,18 +192,20 @@ export function getDailyUsage(keyHash: string): DailyUsage {
         upstreamKeyHash: row.upstream_key_hash,
         requestsCount: row.requests_count,
         tokensEstimated: row.tokens_estimated,
+        inputTokensEstimated: row.input_tokens_estimated || 0,
+        outputTokensEstimated: row.output_tokens_estimated || 0,
       };
     }
   } catch (error) {
     console.error('❌ Failed to query daily usage:', error);
   }
-  return { dateUtc: '', upstreamKeyHash: keyHash, requestsCount: 0, tokensEstimated: 0 };
+  return { dateUtc: '', upstreamKeyHash: keyHash, requestsCount: 0, tokensEstimated: 0, inputTokensEstimated: 0, outputTokensEstimated: 0 };
 }
 
 export function getKeyState(keyHash: string, defaultType: 'free' | 'master'): KeyState {
   try {
     const stmt = db.prepare(`
-      SELECT key_hash, key_type, cooldown_until, exhausted_until, last_error, last_success_at
+      SELECT key_hash, key_type, cooldown_until, exhausted_until, last_error, last_success_at, is_disabled
       FROM upstream_key_state
       WHERE key_hash = ?
     `);
@@ -178,6 +218,7 @@ export function getKeyState(keyHash: string, defaultType: 'free' | 'master'): Ke
         exhaustedUntil: row.exhausted_until,
         lastError: row.last_error,
         lastSuccessAt: row.last_success_at,
+        isDisabled: row.is_disabled === 1,
       };
     }
   } catch (error) {
@@ -190,6 +231,7 @@ export function getKeyState(keyHash: string, defaultType: 'free' | 'master'): Ke
     exhaustedUntil: 0,
     lastError: null,
     lastSuccessAt: null,
+    isDisabled: false,
   };
 }
 
@@ -224,12 +266,27 @@ export function setExhausted(keyHash: string, keyType: 'free' | 'master', durati
   }
 }
 
+export function setDisabled(keyHash: string, keyType: 'free' | 'master', errorMsg: string) {
+  try {
+    const stmt = db.prepare(`
+      INSERT INTO upstream_key_state (key_hash, key_type, is_disabled, last_error)
+      VALUES (?, ?, 1, ?)
+      ON CONFLICT(key_hash) DO UPDATE SET
+        is_disabled = 1,
+        last_error = ?
+    `);
+    stmt.run(keyHash, keyType, errorMsg, errorMsg);
+  } catch (error) {
+    console.error('❌ Failed to set key disabled in SQLite:', error);
+  }
+}
+
 export function clearKeyError(keyHash: string, keyType: 'free' | 'master') {
   try {
     const nowStr = new Date().toISOString();
     const stmt = db.prepare(`
-      INSERT INTO upstream_key_state (key_hash, key_type, cooldown_until, exhausted_until, last_error, last_success_at)
-      VALUES (?, ?, 0, 0, NULL, ?)
+      INSERT INTO upstream_key_state (key_hash, key_type, cooldown_until, exhausted_until, last_error, last_success_at, is_disabled)
+      VALUES (?, ?, 0, 0, NULL, ?, 0)
       ON CONFLICT(key_hash) DO UPDATE SET
         cooldown_until = 0,
         exhausted_until = CASE 
@@ -237,7 +294,8 @@ export function clearKeyError(keyHash: string, keyType: 'free' | 'master') {
           ELSE 0 
         END,
         last_error = NULL,
-        last_success_at = ?
+        last_success_at = ?,
+        is_disabled = 0
     `);
     stmt.run(keyHash, keyType, nowStr, Date.now(), nowStr);
   } catch (error) {
@@ -251,12 +309,14 @@ export function getApiStatusDetails(
 ): {
   service: { ok: boolean; uptimeSec: number };
   upstreamKeys: any[];
-  usageEstimate: { dateUtc: string; requests: number; tokens: number };
+  usageEstimate: { dateUtc: string; requests: number; tokens: number; inputTokens: number; outputTokens: number };
 } {
   const today = new Date().toISOString().split('T')[0];
   const keysInfo: any[] = [];
   let totalRequests = 0;
   let totalTokens = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
 
   // Process free keys
   for (const k of freeKeys) {
@@ -267,23 +327,29 @@ export function getApiStatusDetails(
 
     totalRequests += usage.requestsCount;
     totalTokens += usage.tokensEstimated;
+    totalInputTokens += usage.inputTokensEstimated;
+    totalOutputTokens += usage.outputTokensEstimated;
 
     const now = Date.now();
     const isCooldown = state.cooldownUntil > now;
     const isExhausted = state.exhaustedUntil > now;
+    const isDisabled = state.isDisabled;
 
     keysInfo.push({
       label,
       hash,
       keyType: 'free',
-      healthy: !isCooldown && !isExhausted && state.lastError === null,
+      healthy: !isDisabled && !isCooldown && !isExhausted && state.lastError === null,
       cooldownUntil: isCooldown ? new Date(state.cooldownUntil).toISOString() : null,
       exhaustedUntil: isExhausted ? new Date(state.exhaustedUntil).toISOString() : null,
+      isDisabled,
       lastError: state.lastError,
       lastSuccessAt: state.lastSuccessAt,
       usageToday: {
         requests: usage.requestsCount,
         tokens: usage.tokensEstimated,
+        inputTokens: usage.inputTokensEstimated,
+        outputTokens: usage.outputTokensEstimated,
       },
     });
   }
@@ -297,22 +363,28 @@ export function getApiStatusDetails(
 
     totalRequests += usage.requestsCount;
     totalTokens += usage.tokensEstimated;
+    totalInputTokens += usage.inputTokensEstimated;
+    totalOutputTokens += usage.outputTokensEstimated;
 
     const now = Date.now();
     const isCooldown = state.cooldownUntil > now;
+    const isDisabled = state.isDisabled;
 
     keysInfo.push({
       label,
       hash,
       keyType: 'master',
-      healthy: !isCooldown && state.lastError === null,
+      healthy: !isDisabled && !isCooldown && state.lastError === null,
       cooldownUntil: isCooldown ? new Date(state.cooldownUntil).toISOString() : null,
       exhaustedUntil: null,
+      isDisabled,
       lastError: state.lastError,
       lastSuccessAt: state.lastSuccessAt,
       usageToday: {
         requests: usage.requestsCount,
         tokens: usage.tokensEstimated,
+        inputTokens: usage.inputTokensEstimated,
+        outputTokens: usage.outputTokensEstimated,
       },
     });
   }
@@ -333,6 +405,8 @@ export function getApiStatusDetails(
       dateUtc: today,
       requests: totalRequests,
       tokens: totalTokens,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
     },
   };
 }
