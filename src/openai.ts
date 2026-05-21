@@ -9,7 +9,7 @@ interface Usage {
   total_tokens: number;
 }
 
-export async function forwardChatCompletions(req: Request, res: Response): Promise<void> {
+export async function forwardChatCompletions(req: Request, res: Response, retryCount = 0): Promise<void> {
   const startTime = Date.now();
   let body = { ...req.body };
 
@@ -42,7 +42,10 @@ export async function forwardChatCompletions(req: Request, res: Response): Promi
 
   // For streaming, inject stream_options to get usage details at the end
   if (isStream) {
-    body.stream_options = { include_usage: true };
+    body.stream_options = {
+      ...body.stream_options,
+      include_usage: true
+    };
   }
 
   let selectedKey: SelectedKey;
@@ -110,9 +113,9 @@ export async function forwardChatCompletions(req: Request, res: Response): Promi
 
       // Attempt retry if limits permit and it's a retryable error status (429, 500, 502, 503, 504)
       const isRetryable = [429, 500, 502, 503, 504].includes(response.status);
-      if (isRetryable && selectedKey.type === 'free') {
-        console.log(`🔄 Retryable error ${response.status}. Retrying another key...`);
-        return forwardChatCompletions(req, res); // Recurse to try next key
+      if (isRetryable && selectedKey.type === 'free' && retryCount < config.maxRetries) {
+        console.log(`🔄 Retryable error ${response.status}. Retrying another key... (Attempt ${retryCount + 1}/${config.maxRetries})`);
+        return forwardChatCompletions(req, res, retryCount + 1); // Recurse to try next key
       }
 
       // Propagate the upstream error back to client

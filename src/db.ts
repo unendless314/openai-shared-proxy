@@ -80,8 +80,9 @@ export function initDb() {
 
   console.log('✅ SQLite database initialized successfully.');
 
-  // Run initial auto-pruning
+  // Run initial auto-pruning and schedule daily log pruning
   pruneLogs();
+  setInterval(pruneLogs, 24 * 60 * 60 * 1000);
 }
 
 export function pruneLogs() {

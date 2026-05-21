@@ -13,13 +13,9 @@ initDb();
 
 // Secure constant-time string comparison to prevent timing attacks
 export function timingSafeCompare(a: string, b: string): boolean {
-  const aBuf = Buffer.from(a);
-  const bBuf = Buffer.from(b);
-  if (aBuf.length !== bBuf.length) {
-    crypto.timingSafeEqual(aBuf, aBuf); // Dummy run
-    return false;
-  }
-  return crypto.timingSafeEqual(aBuf, bBuf);
+  const aHash = crypto.createHash('sha256').update(a).digest();
+  const bHash = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(aHash, bHash);
 }
 
 // Client Bearer Token Authentication Middleware

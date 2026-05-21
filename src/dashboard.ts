@@ -1,5 +1,14 @@
 import { config } from './config.js';
 
+function escapeHtml(unsafe: string): string {
+  return unsafe
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 interface UsageToday {
   requests: number;
   tokens: number;
@@ -67,12 +76,14 @@ export function renderDashboard(details: StatusDetails): string {
       statusClass = 'badge-cooldown';
       pulseClass = 'pulse-yellow';
       const timeRemaining = Math.max(0, Math.round((new Date(key.cooldownUntil).getTime() - Date.now()) / 1000));
-      alertDetails = `<div class="key-alert warning">Temp cooldown: ${timeRemaining}s remaining.<br><span class="error-msg">${key.lastError || ''}</span></div>`;
+      const safeError = key.lastError ? escapeHtml(key.lastError) : '';
+      alertDetails = `<div class="key-alert warning">Temp cooldown: ${timeRemaining}s remaining.<br><span class="error-msg">${safeError}</span></div>`;
     } else if (!key.healthy) {
       statusLabel = 'Unhealthy';
       statusClass = 'badge-danger';
       pulseClass = 'pulse-red';
-      alertDetails = `<div class="key-alert danger">Error: ${key.lastError || 'Unknown key error'}</div>`;
+      const safeError = key.lastError ? escapeHtml(key.lastError) : 'Unknown key error';
+      alertDetails = `<div class="key-alert danger">Error: ${safeError}</div>`;
     }
 
     // Token Progress Bar calculations
@@ -785,6 +796,17 @@ export function renderDashboard(details: StatusDetails): string {
     const tokenLimit = ${tokenLimit};
     const reqLimit = ${reqLimit};
 
+    // Client-side HTML escaping helper to prevent XSS
+    function escapeHtml(unsafe) {
+      if (!unsafe) return '';
+      return unsafe
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
     // Helper to format seconds to human readable
     function formatUptime(seconds) {
       const d = Math.floor(seconds / (3600 * 24));
@@ -867,12 +889,12 @@ export function renderDashboard(details: StatusDetails): string {
               statusLabel = 'Cooldown';
               statusClass = 'badge badge-cooldown';
               pulseClass = 'pulse-indicator pulse-yellow';
-              alertHtml = '<div class="key-alert warning">Temp cooldown: ' + timeRemaining + 's remaining.<br><span class="error-msg">' + (key.lastError || '') + '</span></div>';
+              alertHtml = '<div class="key-alert warning">Temp cooldown: ' + timeRemaining + 's remaining.<br><span class="error-msg">' + escapeHtml(key.lastError || '') + '</span></div>';
             } else if (!key.healthy) {
               statusLabel = 'Unhealthy';
               statusClass = 'badge badge-danger';
               pulseClass = 'pulse-indicator pulse-red';
-              alertHtml = '<div class="key-alert danger">Error: ' + (key.lastError || 'Unknown key error') + '</div>';
+              alertHtml = '<div class="key-alert danger">Error: ' + escapeHtml(key.lastError || 'Unknown key error') + '</div>';
             }
 
             pulse.className = pulseClass;
