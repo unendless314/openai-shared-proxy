@@ -1,0 +1,147 @@
+import express, { Request, Response, NextFunction } from 'express';
+import crypto from 'crypto';
+import { config } from './config.js';
+import { initDb, getApiStatusDetails } from './db.js';
+import { forwardChatCompletions } from './openai.js';
+import { renderDashboard } from './dashboard.js';
+
+const app = express();
+app.use(express.json());
+
+// Initialize SQLite database
+initDb();
+
+// Secure constant-time string comparison to prevent timing attacks
+export function timingSafeCompare(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) {
+    crypto.timingSafeEqual(aBuf, aBuf); // Dummy run
+    return false;
+  }
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+// Client Bearer Token Authentication Middleware
+function authenticateClient(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    res.status(401).json({
+      error: {
+        message: 'Missing or malformed Authorization header. Must be "Bearer <PROXY_API_KEY>".',
+        type: 'authentication_error',
+        code: 'missing_token'
+      }
+    });
+    return;
+  }
+
+  const token = authHeader.substring(7);
+  if (!timingSafeCompare(token, config.proxyApiKey)) {
+    res.status(401).json({
+      error: {
+        message: 'Invalid proxy API key provided.',
+        type: 'authentication_error',
+        code: 'invalid_token'
+      }
+    });
+    return;
+  }
+
+  next();
+}
+
+// Admin HTTP Basic Authentication Middleware
+function authenticateAdmin(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Basic ')) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="Proxy Dashboard"');
+    res.status(401).send('Authentication required for administrative access.');
+    return;
+  }
+
+  const base64Credentials = authHeader.substring(6);
+  const credentials = Buffer.from(base64Credentials, 'base64').toString('ascii');
+  const [username, password] = credentials.split(':');
+
+  if (
+    !timingSafeCompare(username || '', config.adminUsername) ||
+    !timingSafeCompare(password || '', config.adminPassword)
+  ) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="Proxy Dashboard"');
+    res.status(401).send('Invalid admin username or password.');
+    return;
+  }
+
+  next();
+}
+
+// ----------------------------------------------------
+// Public Endpoints
+// ----------------------------------------------------
+
+app.get('/health', (req: Request, res: Response) => {
+  res.json({ ok: true });
+});
+
+// ----------------------------------------------------
+// Client API Endpoints (Bearer Authenticated)
+// ----------------------------------------------------
+
+app.post('/v1/chat/completions', authenticateClient, (req: Request, res: Response) => {
+  forwardChatCompletions(req, res);
+});
+
+app.get('/v1/models', authenticateClient, (req: Request, res: Response) => {
+  res.json({
+    object: 'list',
+    data: [
+      {
+        id: 'gpt-4o',
+        object: 'model',
+        created: 1715644800,
+        owned_by: 'openai'
+      },
+      {
+        id: 'gpt-4o-mini',
+        object: 'model',
+        created: 1721260800,
+        owned_by: 'openai'
+      },
+      {
+        id: 'o1-mini',
+        object: 'model',
+        created: 1726185600,
+        owned_by: 'openai'
+      },
+      {
+        id: 'o3-mini',
+        object: 'model',
+        created: 1738281600,
+        owned_by: 'openai'
+      }
+    ]
+  });
+});
+
+// ----------------------------------------------------
+// Administrative Dashboard Endpoints (Basic Auth)
+// ----------------------------------------------------
+
+app.get('/status', authenticateAdmin, (req: Request, res: Response) => {
+  const statusDetails = getApiStatusDetails(config.openaiSharedKeys, config.openaiMasterKey);
+  const html = renderDashboard(statusDetails);
+  res.setHeader('Content-Type', 'text/html');
+  res.send(html);
+});
+
+app.get('/api/status', authenticateAdmin, (req: Request, res: Response) => {
+  const statusDetails = getApiStatusDetails(config.openaiSharedKeys, config.openaiMasterKey);
+  res.json(statusDetails);
+});
+
+// Start Server
+app.listen(config.port, config.host, () => {
+  console.log(`🚀 openai-shared-proxy is running on http://${config.host}:${config.port}`);
+  console.log(`🔒 Proxy Bearer Auth enabled. admin Basic Auth enabled on /status.`);
+});
