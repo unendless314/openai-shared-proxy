@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { config } from './config.js';
 import { initDb, getApiStatusDetails } from './db.js';
 import { forwardChatCompletions } from './openai.js';
+import { selectNextKey } from './router.js';
 import { renderDashboard } from './dashboard.js';
 
 const app = express();
@@ -88,36 +89,40 @@ app.post('/v1/chat/completions', authenticateClient, (req: Request, res: Respons
   forwardChatCompletions(req, res);
 });
 
-app.get('/v1/models', authenticateClient, (req: Request, res: Response) => {
-  res.json({
-    object: 'list',
-    data: [
-      {
-        id: 'gpt-4o',
-        object: 'model',
-        created: 1715644800,
-        owned_by: 'openai'
-      },
-      {
-        id: 'gpt-4o-mini',
-        object: 'model',
-        created: 1721260800,
-        owned_by: 'openai'
-      },
-      {
-        id: 'o1-mini',
-        object: 'model',
-        created: 1726185600,
-        owned_by: 'openai'
-      },
-      {
-        id: 'o3-mini',
-        object: 'model',
-        created: 1738281600,
-        owned_by: 'openai'
+app.get('/v1/models', authenticateClient, async (req: Request, res: Response) => {
+  try {
+    const selectedKey = selectNextKey();
+    const response = await fetch(`${config.openaiBaseUrl}/models`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${selectedKey.key}`
       }
-    ]
-  });
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      return res.status(response.status).json(errorData);
+    }
+
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    console.error('Failed to fetch models dynamically from upstream, falling back to emergency static list:', error);
+    
+    // Emergency Fallback: Only return a single model (gpt-4o) as a diagnostics indicator
+    // that upstream keys are exhausted/cooldowned or network is down.
+    res.json({
+      object: 'list',
+      data: [
+        {
+          id: 'gpt-4o',
+          object: 'model',
+          created: 1715644800,
+          owned_by: 'openai'
+        }
+      ]
+    });
+  }
 });
 
 // ----------------------------------------------------

@@ -161,7 +161,7 @@ export function renderDashboard(details: StatusDetails): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OpenRouter Shared Proxy Administrative Dashboard</title>
+  <title>OpenAI Shared Proxy Administrative Dashboard</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -703,7 +703,7 @@ export function renderDashboard(details: StatusDetails): string {
   <div class="container">
     <header>
       <div class="brand">
-        <h1>OpenRouter Shared Proxy</h1>
+        <h1>OpenAI Shared Proxy</h1>
         <p>Cost-optimized aggregation & smart routing backend dashboard</p>
       </div>
       <div class="controls">
@@ -796,7 +796,7 @@ export function renderDashboard(details: StatusDetails): string {
     </div>
 
     <footer>
-      <p>Powered by 🚀 <a href="https://github.com/linchunchiao/OpenRouter" target="_blank">OpenRouter Shared Proxy</a> &bull; Antigravity Engine v1.0.0</p>
+      <p>Powered by 🚀 <a href="https://github.com/linchunchiao/openai-shared-proxy" target="_blank">OpenAI Shared Proxy</a> &bull; Antigravity Engine v1.0.0</p>
     </footer>
   </div>
 
