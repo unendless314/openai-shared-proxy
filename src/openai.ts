@@ -43,6 +43,13 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
     delete body.reasoningSummary;
   }
 
+  // OpenAI's legacy /v1/chat/completions does not support combined 'tools' and 'reasoning_effort'.
+  // If 'tools' are present, we must strip out 'reasoning_effort' to ensure compatibility.
+  if (body.tools && body.reasoning_effort !== undefined) {
+    console.log("🛠️ Tool call detected along with reasoning_effort. Stripping 'reasoning_effort' to ensure compatibility.");
+    delete body.reasoning_effort;
+  }
+
   const isStream = body.stream === true;
 
   // For streaming, inject stream_options to get usage details at the end
