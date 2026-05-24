@@ -7,6 +7,9 @@ interface Usage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  prompt_tokens_details?: {
+    cached_tokens?: number;
+  };
 }
 
 export async function forwardChatCompletions(req: Request, res: Response, retryCount = 0): Promise<void> {
@@ -165,6 +168,7 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
       let sseBuffer = '';
       let promptTokens = 0;
       let completionTokens = 0;
+      let cachedTokens = 0;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -189,6 +193,9 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
                 const u = parsed.usage as Usage;
                 promptTokens = u.prompt_tokens;
                 completionTokens = u.completion_tokens;
+                if (u.prompt_tokens_details?.cached_tokens) {
+                  cachedTokens = u.prompt_tokens_details.cached_tokens;
+                }
               }
             } catch {}
           }
@@ -217,10 +224,11 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
         latencyMs: latency,
         estimatedInputTokens: finalInputTokens,
         estimatedOutputTokens: finalOutputTokens,
+        cachedInputTokens: cachedTokens,
         keyType: selectedKey.type
       });
 
-      updateDailyUsage(selectedKey.hash, finalInputTokens, finalOutputTokens);
+      updateDailyUsage(selectedKey.hash, finalInputTokens, finalOutputTokens, cachedTokens);
 
     } else {
       // 4. NON-STREAMING FLOW
@@ -230,6 +238,7 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
       const latency = Date.now() - startTime;
       let promptTokens = responseJson.usage?.prompt_tokens;
       let completionTokens = responseJson.usage?.completion_tokens;
+      let cachedTokens = responseJson.usage?.prompt_tokens_details?.cached_tokens || 0;
 
       // Fallback estimation
       if (promptTokens === undefined) {
@@ -247,10 +256,11 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
         latencyMs: latency,
         estimatedInputTokens: promptTokens,
         estimatedOutputTokens: completionTokens,
+        cachedInputTokens: cachedTokens,
         keyType: selectedKey.type
       });
 
-      updateDailyUsage(selectedKey.hash, promptTokens || 0, completionTokens || 0);
+      updateDailyUsage(selectedKey.hash, promptTokens || 0, completionTokens || 0, cachedTokens);
     }
 
   } catch (error: any) {

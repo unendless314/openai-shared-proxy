@@ -11,6 +11,7 @@ export interface RequestLog {
   latencyMs: number;
   estimatedInputTokens: number;
   estimatedOutputTokens: number;
+  cachedInputTokens: number;
   keyType: 'free' | 'master';
 }
 
@@ -31,6 +32,7 @@ export interface DailyUsage {
   tokensEstimated: number;
   inputTokensEstimated: number;
   outputTokensEstimated: number;
+  cachedTokensEstimated: number;
 }
 
 // Generate a safe hash for an API key to identify it without exposing it
@@ -47,7 +49,31 @@ export function initDb() {
   db = new Database(config.sqlitePath);
   db.pragma('journal_mode = WAL');
 
-  // Create Tables
+  // Check if we need to reset schema because of missing cached columns in either table
+  let needsReset = false;
+  try {
+    db.prepare("SELECT cached_input_tokens FROM request_log LIMIT 1").get();
+    db.prepare("SELECT cached_tokens_estimated FROM daily_usage_estimate LIMIT 1").get();
+  } catch (err: any) {
+    if (err.message.includes('no such column') || err.message.includes('no such table')) {
+      needsReset = true;
+    }
+  }
+
+  if (needsReset) {
+    console.log('🔄 Resetting SQLite schema to include cache tracking fields...');
+    try {
+      db.exec(`
+        DROP TABLE IF EXISTS request_log;
+        DROP TABLE IF EXISTS upstream_key_state;
+        DROP TABLE IF EXISTS daily_usage_estimate;
+      `);
+    } catch (e) {
+      console.warn('Failed to drop old tables:', e);
+    }
+  }
+
+  // Create Tables with new columns directly
   db.exec(`
     CREATE TABLE IF NOT EXISTS request_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +84,7 @@ export function initDb() {
       latency_ms INTEGER,
       estimated_input_tokens INTEGER,
       estimated_output_tokens INTEGER,
+      cached_input_tokens INTEGER DEFAULT 0,
       key_type TEXT
     );
 
@@ -78,36 +105,12 @@ export function initDb() {
       tokens_estimated INTEGER DEFAULT 0,
       input_tokens_estimated INTEGER DEFAULT 0,
       output_tokens_estimated INTEGER DEFAULT 0,
+      cached_tokens_estimated INTEGER DEFAULT 0,
       PRIMARY KEY (date_utc, upstream_key_hash)
     );
 
     CREATE INDEX IF NOT EXISTS idx_req_log_created ON request_log (created_at);
   `);
-
-  // Run dynamic schema migrations for existing databases
-  try {
-    db.exec(`ALTER TABLE upstream_key_state ADD COLUMN is_disabled INTEGER DEFAULT 0`);
-  } catch (err: any) {
-    if (!err.message.includes('duplicate column name')) {
-      console.error('Failed to migrate upstream_key_state (is_disabled):', err);
-    }
-  }
-
-  try {
-    db.exec(`ALTER TABLE daily_usage_estimate ADD COLUMN input_tokens_estimated INTEGER DEFAULT 0`);
-  } catch (err: any) {
-    if (!err.message.includes('duplicate column name')) {
-      console.error('Failed to migrate daily_usage_estimate (input_tokens_estimated):', err);
-    }
-  }
-
-  try {
-    db.exec(`ALTER TABLE daily_usage_estimate ADD COLUMN output_tokens_estimated INTEGER DEFAULT 0`);
-  } catch (err: any) {
-    if (!err.message.includes('duplicate column name')) {
-      console.error('Failed to migrate daily_usage_estimate (output_tokens_estimated):', err);
-    }
-  }
 
   console.log('✅ SQLite database initialized successfully.');
 
@@ -137,8 +140,8 @@ export function logRequest(log: RequestLog) {
     const stmt = db.prepare(`
       INSERT INTO request_log (
         upstream_key_hash, model, status_code, latency_ms, 
-        estimated_input_tokens, estimated_output_tokens, key_type
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        estimated_input_tokens, estimated_output_tokens, cached_input_tokens, key_type
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
     stmt.run(
       log.upstreamKeyHash,
@@ -147,6 +150,7 @@ export function logRequest(log: RequestLog) {
       log.latencyMs,
       log.estimatedInputTokens,
       log.estimatedOutputTokens,
+      log.cachedInputTokens,
       log.keyType
     );
   } catch (error) {
@@ -154,23 +158,31 @@ export function logRequest(log: RequestLog) {
   }
 }
 
-export function updateDailyUsage(keyHash: string, inputTokens: number, outputTokens: number) {
+export function updateDailyUsage(keyHash: string, inputTokens: number, outputTokens: number, cachedTokens: number) {
   try {
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD in UTC
+    
+    // Quota limits are evaluated 1:1 based on raw tokens, as upstream TPM/RPM limits count
+    // all input tokens regardless of whether they are served from cache.
     const totalTokens = inputTokens + outputTokens;
+
     const stmt = db.prepare(`
       INSERT INTO daily_usage_estimate (
         date_utc, upstream_key_hash, requests_count, tokens_estimated,
-        input_tokens_estimated, output_tokens_estimated
+        input_tokens_estimated, output_tokens_estimated, cached_tokens_estimated
       )
-      VALUES (?, ?, 1, ?, ?, ?)
+      VALUES (?, ?, 1, ?, ?, ?, ?)
       ON CONFLICT(date_utc, upstream_key_hash) DO UPDATE SET
         requests_count = requests_count + 1,
         tokens_estimated = tokens_estimated + ?,
         input_tokens_estimated = input_tokens_estimated + ?,
-        output_tokens_estimated = output_tokens_estimated + ?
+        output_tokens_estimated = output_tokens_estimated + ?,
+        cached_tokens_estimated = cached_tokens_estimated + ?
     `);
-    stmt.run(today, keyHash, totalTokens, inputTokens, outputTokens, totalTokens, inputTokens, outputTokens);
+    stmt.run(
+      today, keyHash, totalTokens, inputTokens, outputTokens, cachedTokens,
+      totalTokens, inputTokens, outputTokens, cachedTokens
+    );
   } catch (error) {
     console.error('❌ Failed to update daily usage in SQLite:', error);
   }
@@ -181,7 +193,7 @@ export function getDailyUsage(keyHash: string): DailyUsage {
     const today = new Date().toISOString().split('T')[0];
     const stmt = db.prepare(`
       SELECT date_utc, upstream_key_hash, requests_count, tokens_estimated,
-             input_tokens_estimated, output_tokens_estimated
+             input_tokens_estimated, output_tokens_estimated, cached_tokens_estimated
       FROM daily_usage_estimate
       WHERE date_utc = ? AND upstream_key_hash = ?
     `);
@@ -194,12 +206,13 @@ export function getDailyUsage(keyHash: string): DailyUsage {
         tokensEstimated: row.tokens_estimated,
         inputTokensEstimated: row.input_tokens_estimated || 0,
         outputTokensEstimated: row.output_tokens_estimated || 0,
+        cachedTokensEstimated: row.cached_tokens_estimated || 0,
       };
     }
   } catch (error) {
     console.error('❌ Failed to query daily usage:', error);
   }
-  return { dateUtc: '', upstreamKeyHash: keyHash, requestsCount: 0, tokensEstimated: 0, inputTokensEstimated: 0, outputTokensEstimated: 0 };
+  return { dateUtc: '', upstreamKeyHash: keyHash, requestsCount: 0, tokensEstimated: 0, inputTokensEstimated: 0, outputTokensEstimated: 0, cachedTokensEstimated: 0 };
 }
 
 export function getKeyState(keyHash: string, defaultType: 'free' | 'master'): KeyState {
@@ -309,7 +322,7 @@ export function getApiStatusDetails(
 ): {
   service: { ok: boolean; uptimeSec: number };
   upstreamKeys: any[];
-  usageEstimate: { dateUtc: string; requests: number; tokens: number; inputTokens: number; outputTokens: number };
+  usageEstimate: { dateUtc: string; requests: number; tokens: number; inputTokens: number; outputTokens: number; cachedTokens: number };
 } {
   const today = new Date().toISOString().split('T')[0];
   const keysInfo: any[] = [];
@@ -317,6 +330,7 @@ export function getApiStatusDetails(
   let totalTokens = 0;
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  let totalCachedTokens = 0;
 
   // Process free keys
   for (const k of freeKeys) {
@@ -329,6 +343,7 @@ export function getApiStatusDetails(
     totalTokens += usage.tokensEstimated;
     totalInputTokens += usage.inputTokensEstimated;
     totalOutputTokens += usage.outputTokensEstimated;
+    totalCachedTokens += usage.cachedTokensEstimated;
 
     const now = Date.now();
     const isCooldown = state.cooldownUntil > now;
@@ -350,6 +365,7 @@ export function getApiStatusDetails(
         tokens: usage.tokensEstimated,
         inputTokens: usage.inputTokensEstimated,
         outputTokens: usage.outputTokensEstimated,
+        cachedTokens: usage.cachedTokensEstimated,
       },
     });
   }
@@ -365,6 +381,7 @@ export function getApiStatusDetails(
     totalTokens += usage.tokensEstimated;
     totalInputTokens += usage.inputTokensEstimated;
     totalOutputTokens += usage.outputTokensEstimated;
+    totalCachedTokens += usage.cachedTokensEstimated;
 
     const now = Date.now();
     const isCooldown = state.cooldownUntil > now;
@@ -385,6 +402,7 @@ export function getApiStatusDetails(
         tokens: usage.tokensEstimated,
         inputTokens: usage.inputTokensEstimated,
         outputTokens: usage.outputTokensEstimated,
+        cachedTokens: usage.cachedTokensEstimated,
       },
     });
   }
@@ -407,6 +425,7 @@ export function getApiStatusDetails(
       tokens: totalTokens,
       inputTokens: totalInputTokens,
       outputTokens: totalOutputTokens,
+      cachedTokens: totalCachedTokens,
     },
   };
 }

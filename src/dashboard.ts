@@ -14,6 +14,7 @@ interface UsageToday {
   tokens: number;
   inputTokens: number;
   outputTokens: number;
+  cachedTokens: number;
 }
 
 interface UpstreamKeyInfo {
@@ -32,7 +33,7 @@ interface UpstreamKeyInfo {
 interface StatusDetails {
   service: { ok: boolean; uptimeSec: number };
   upstreamKeys: UpstreamKeyInfo[];
-  usageEstimate: { dateUtc: string; requests: number; tokens: number; inputTokens: number; outputTokens: number };
+  usageEstimate: { dateUtc: string; requests: number; tokens: number; inputTokens: number; outputTokens: number; cachedTokens: number };
 }
 
 // Helper to format uptime into human-readable string
@@ -109,6 +110,11 @@ export function renderDashboard(details: StatusDetails): string {
     const reqDisplay = reqCap === Infinity ? `${reqVal.toLocaleString()} (No Cap)` : `${reqVal.toLocaleString()} / ${reqCap.toLocaleString()}`;
     const reqProgressClass = reqPercent > 80 ? 'progress-danger' : reqPercent > 50 ? 'progress-warning' : 'progress-success';
 
+    // Cache hit ratio for this key
+    const keyInputTokens = key.usageToday.inputTokens || 0;
+    const keyCachedTokens = key.usageToday.cachedTokens || 0;
+    const keyHitRatio = keyInputTokens > 0 ? ((keyCachedTokens / keyInputTokens) * 100).toFixed(1) : '0.0';
+
     return `
       <div class="key-card" data-key-hash="${key.hash}">
         <div class="key-card-header">
@@ -144,6 +150,14 @@ export function renderDashboard(details: StatusDetails): string {
               <div class="progress-bar ${reqProgressClass} req-bar" style="width: ${isFree ? reqPercent : 0}%"></div>
             </div>
           </div>
+
+          <!-- Cached Tokens Meter -->
+          <div class="metric-group">
+            <div class="metric-label-row">
+              <span>Cached Tokens</span>
+              <span class="metric-value-text cached-value">${keyCachedTokens.toLocaleString()} (${keyHitRatio}%)</span>
+            </div>
+          </div>
         </div>
 
         ${alertDetails ? `<div class="alert-container">${alertDetails}</div>` : '<div class="alert-container"></div>'}
@@ -154,6 +168,10 @@ export function renderDashboard(details: StatusDetails): string {
       </div>
     `;
   }).join('');
+
+  const globalInputTokens = details.usageEstimate.inputTokens || 0;
+  const globalCachedTokens = details.usageEstimate.cachedTokens || 0;
+  const globalHitRatio = globalInputTokens > 0 ? ((globalCachedTokens / globalInputTokens) * 100).toFixed(1) : '0.0';
 
   return `
 <!DOCTYPE html>
@@ -311,7 +329,7 @@ export function renderDashboard(details: StatusDetails): string {
     /* Grid of Key metrics summary */
     .stats-summary-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 1.5rem;
       margin-bottom: 2.5rem;
     }
@@ -738,6 +756,16 @@ export function renderDashboard(details: StatusDetails): string {
         <div class="stat-label">Global Tokens Estimated</div>
         <div class="stat-value" id="val-global-tokens">${details.usageEstimate.tokens.toLocaleString()}</div>
       </div>
+
+      <div class="stat-card">
+        <div class="stat-label">Global Cached Tokens</div>
+        <div class="stat-value" id="val-global-cached">${globalCachedTokens.toLocaleString()}</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">Global Cache Hit Ratio</div>
+        <div class="stat-value" id="val-cache-hit-ratio">${globalHitRatio}%</div>
+      </div>
     </div>
 
     <!-- Active Upstream Keys -->
@@ -864,6 +892,12 @@ export function renderDashboard(details: StatusDetails): string {
         document.getElementById('val-uptime').textContent = formatUptime(data.service.uptimeSec);
         document.getElementById('val-global-requests').textContent = data.usageEstimate.requests.toLocaleString();
         document.getElementById('val-global-tokens').textContent = data.usageEstimate.tokens.toLocaleString();
+        document.getElementById('val-global-cached').textContent = (data.usageEstimate.cachedTokens || 0).toLocaleString();
+        
+        const globalInputTokens = data.usageEstimate.inputTokens || 0;
+        const globalCachedTokens = data.usageEstimate.cachedTokens || 0;
+        const globalHitRatio = globalInputTokens > 0 ? ((globalCachedTokens / globalInputTokens) * 100).toFixed(1) : '0.0';
+        document.getElementById('val-cache-hit-ratio').textContent = globalHitRatio + '%';
 
         // 3. Update upstream keys cards
         const container = document.getElementById('keys-container');
@@ -938,6 +972,15 @@ export function renderDashboard(details: StatusDetails): string {
             const reqBar = keyCard.querySelector('.req-bar');
             reqBar.style.width = (isFree ? reqPercent : 0) + '%';
             reqBar.className = 'progress-bar req-bar ' + (reqPercent > 80 ? 'progress-danger' : reqPercent > 50 ? 'progress-warning' : 'progress-success');
+
+            // Update Cached Tokens and Hit Ratio
+            const keyInputTokens = key.usageToday.inputTokens || 0;
+            const keyCachedTokens = key.usageToday.cachedTokens || 0;
+            const keyHitRatio = keyInputTokens > 0 ? ((keyCachedTokens / keyInputTokens) * 100).toFixed(1) : '0.0';
+            const cachedValText = keyCard.querySelector('.cached-value');
+            if (cachedValText) {
+              cachedValText.textContent = keyCachedTokens.toLocaleString() + ' (' + keyHitRatio + '%)';
+            }
 
             // Success Time
             const successText = keyCard.querySelector('.key-meta-info span');

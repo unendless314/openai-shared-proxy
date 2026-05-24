@@ -7,8 +7,6 @@ export interface SelectedKey {
   type: 'free' | 'master';
 }
 
-let lastFreeKeyIndex = -1;
-
 function getNextUtcMidnight(): number {
   const now = new Date();
   const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0));
@@ -19,13 +17,10 @@ export function selectNextKey(): SelectedKey {
   const freeKeys = config.openaiSharedKeys;
   const now = Date.now();
 
-  // 1. Try to select a healthy, non-exhausted key from the Free Pool
+  // 1. Try to select a healthy, non-exhausted key from the Free Pool in a fixed sequence
   if (freeKeys.length > 0) {
-    const startIndex = (lastFreeKeyIndex + 1) % freeKeys.length;
-    
     for (let i = 0; i < freeKeys.length; i++) {
-      const index = (startIndex + i) % freeKeys.length;
-      const key = freeKeys[index];
+      const key = freeKeys[i];
       const hash = hashKey(key);
       
       const state = getKeyState(hash, 'free');
@@ -59,8 +54,7 @@ export function selectNextKey(): SelectedKey {
         continue; // Skip this key, try the next one
       }
 
-      // Found a valid key! Update the index and return it
-      lastFreeKeyIndex = index;
+      // Found a valid healthy key!
       return {
         key,
         hash,
