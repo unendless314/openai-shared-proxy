@@ -3,66 +3,349 @@ import { config } from './config.js';
 import { selectNextKey, handleKeyFailure, handleKeySuccess, SelectedKey } from './router.js';
 import { logRequest, updateDailyUsage } from './db.js';
 
-interface Usage {
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
-  prompt_tokens_details?: {
-    cached_tokens?: number;
-  };
+export interface ProxyUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
 }
 
-export async function forwardChatCompletions(req: Request, res: Response, retryCount = 0): Promise<void> {
-  const startTime = Date.now();
-  let body = { ...req.body };
+export interface ProxyAdapter {
+  name: 'chat_completions' | 'responses';
+  upstreamPath: string;
+  normalizeBody(body: any): { ok: true; body: any } | { ok: false; status: number; error: any };
+  isStreamRequest(body: any): boolean;
+  extractUsageFromJson(body: any, upstreamJson: any): { usage: ProxyUsage | null; statusCode?: number };
+  createStreamTracker(body: any): {
+    onChunk(chunk: string): void;
+    finalize(): { usage: ProxyUsage | null; statusCode?: number };
+  };
+  estimateUsageFallback(body: any, responseJson?: any): ProxyUsage;
+}
 
-  // 1. Normalize Model & Token Limits
-  if (!body.model) {
-    body.model = config.openaiDefaultModel;
-  }
+// ----------------------------------------------------
+// Chat Completions Adapter
+// ----------------------------------------------------
+export const chatAdapter: ProxyAdapter = {
+  name: 'chat_completions',
+  upstreamPath: '/chat/completions',
 
-  const hasMaxTokens = body.max_tokens !== undefined;
-  const hasMaxCompletionTokens = body.max_completion_tokens !== undefined;
+  normalizeBody(body: any) {
+    const nextBody = { ...body };
 
-  if (hasMaxTokens && hasMaxCompletionTokens) {
-    res.status(400).json({
-      error: {
-        message: 'Cannot specify both max_tokens and max_completion_tokens. Please use max_completion_tokens.',
-        type: 'invalid_request_error',
-        code: 'ambiguous_token_limit'
+    if (!nextBody.model) {
+      nextBody.model = config.openaiDefaultModel;
+    }
+
+    const hasMaxTokens = nextBody.max_tokens !== undefined;
+    const hasMaxCompletionTokens = nextBody.max_completion_tokens !== undefined;
+
+    if (hasMaxTokens && hasMaxCompletionTokens) {
+      return {
+        ok: false,
+        status: 400,
+        error: {
+          error: {
+            message: 'Cannot specify both max_tokens and max_completion_tokens. Please use max_completion_tokens.',
+            type: 'invalid_request_error',
+            code: 'ambiguous_token_limit'
+          }
+        }
+      };
+    }
+
+    if (hasMaxTokens) {
+      nextBody.max_completion_tokens = nextBody.max_tokens;
+      delete nextBody.max_tokens;
+    }
+
+    if (nextBody.reasoningSummary !== undefined) {
+      delete nextBody.reasoningSummary;
+    }
+
+    if (nextBody.tools && nextBody.reasoning_effort !== undefined) {
+      console.log("🛠️ Tool call detected along with reasoning_effort. Stripping 'reasoning_effort' to ensure compatibility.");
+      delete nextBody.reasoning_effort;
+    }
+
+    if (nextBody.stream === true) {
+      nextBody.stream_options = {
+        ...nextBody.stream_options,
+        include_usage: true
+      };
+    }
+
+    return { ok: true, body: nextBody };
+  },
+
+  isStreamRequest(body: any) {
+    return body.stream === true;
+  },
+
+  extractUsageFromJson(body: any, upstreamJson: any) {
+    if (!upstreamJson?.usage) return { usage: null };
+    const u = upstreamJson.usage;
+    return {
+      usage: {
+        inputTokens: u.prompt_tokens || 0,
+        outputTokens: u.completion_tokens || 0,
+        cachedInputTokens: u.prompt_tokens_details?.cached_tokens || 0
       }
-    });
-    return;
-  }
+    };
+  },
 
-  // Normalize max_tokens to max_completion_tokens
-  if (hasMaxTokens) {
-    body.max_completion_tokens = body.max_tokens;
-    delete body.max_tokens;
-  }
+  createStreamTracker(body: any) {
+    let sseBuffer = '';
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let cachedTokens = 0;
 
-  // Drop client-side framework specific parameters that OpenAI doesn't natively support
-  if (body.reasoningSummary !== undefined) {
-    delete body.reasoningSummary;
-  }
+    return {
+      onChunk(chunk: string) {
+        sseBuffer += chunk;
+        const lines = sseBuffer.split('\n');
+        sseBuffer = lines.pop() || '';
 
-  // OpenAI's legacy /v1/chat/completions does not support combined 'tools' and 'reasoning_effort'.
-  // If 'tools' are present, we must strip out 'reasoning_effort' to ensure compatibility.
-  if (body.tools && body.reasoning_effort !== undefined) {
-    console.log("🛠️ Tool call detected along with reasoning_effort. Stripping 'reasoning_effort' to ensure compatibility.");
-    delete body.reasoning_effort;
-  }
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data: ')) {
+            const dataStr = trimmed.substring(6).trim();
+            if (dataStr === '[DONE]') continue;
+            try {
+              const parsed = JSON.parse(dataStr);
+              if (parsed.usage) {
+                const u = parsed.usage;
+                promptTokens = u.prompt_tokens || 0;
+                completionTokens = u.completion_tokens || 0;
+                if (u.prompt_tokens_details?.cached_tokens) {
+                  cachedTokens = u.prompt_tokens_details.cached_tokens;
+                }
+              }
+            } catch {}
+          }
+        }
+      },
+      finalize() {
+        if (promptTokens === 0 && completionTokens === 0) return { usage: null };
+        return {
+          usage: {
+            inputTokens: promptTokens,
+            outputTokens: completionTokens,
+            cachedInputTokens: cachedTokens
+          }
+        };
+      }
+    };
+  },
 
-  const isStream = body.stream === true;
+  estimateUsageFallback(body: any, responseJson?: any) {
+    const promptLength = JSON.stringify(body.messages || []).length;
+    const inputEst = Math.max(1, Math.round(promptLength / 4));
+    let outputEst = 100;
 
-  // For streaming, inject stream_options to get usage details at the end
-  if (isStream) {
-    body.stream_options = {
-      ...body.stream_options,
-      include_usage: true
+    if (responseJson) {
+      const respLength = JSON.stringify(responseJson).length;
+      outputEst = Math.max(1, Math.round(respLength / 4));
+    }
+
+    return {
+      inputTokens: inputEst,
+      outputTokens: outputEst,
+      cachedInputTokens: 0
     };
   }
+};
 
+// ----------------------------------------------------
+// Responses Adapter
+// ----------------------------------------------------
+export const responsesAdapter: ProxyAdapter = {
+  name: 'responses',
+  upstreamPath: '/responses',
+
+  normalizeBody(body: any) {
+    const nextBody = { ...body };
+
+    if (!nextBody.model) {
+      nextBody.model = config.openaiDefaultModel;
+    }
+
+    const hasMaxTokens = nextBody.max_tokens !== undefined;
+    const hasMaxOutputTokens = nextBody.max_output_tokens !== undefined;
+
+    if (hasMaxTokens && hasMaxOutputTokens) {
+      return {
+        ok: false,
+        status: 400,
+        error: {
+          error: {
+            message: 'Cannot specify both max_tokens and max_output_tokens. Please use max_output_tokens.',
+            type: 'invalid_request_error',
+            code: 'ambiguous_token_limit'
+          }
+        }
+      };
+    }
+
+    if (hasMaxTokens) {
+      nextBody.max_output_tokens = nextBody.max_tokens;
+      delete nextBody.max_tokens;
+    }
+
+    return { ok: true, body: nextBody };
+  },
+
+  isStreamRequest(body: any) {
+    return body.stream === true;
+  },
+
+  extractUsageFromJson(body: any, upstreamJson: any) {
+    const u = upstreamJson?.usage;
+    const usage = u ? {
+      inputTokens: u.input_tokens || 0,
+      outputTokens: u.output_tokens || 0,
+      cachedInputTokens: u.input_tokens_details?.cached_tokens || 0
+    } : null;
+
+    let statusCode = 200;
+    const status = upstreamJson?.status;
+    if (status === 'failed') {
+      statusCode = 500;
+    } else if (status === 'incomplete') {
+      statusCode = 400;
+    }
+
+    return {
+      usage,
+      statusCode
+    };
+  },
+
+  createStreamTracker(body: any) {
+    let sseBuffer = '';
+    let extractedUsage: ProxyUsage | null = null;
+    let terminalStatus: 'completed' | 'failed' | 'incomplete' | null = null;
+
+    return {
+      onChunk(chunk: string) {
+        sseBuffer += chunk;
+        
+        // Normalize CRLF to LF, and split by double line breaks
+        const normalizedBuffer = sseBuffer.replace(/\r\n/g, '\n');
+        const blocks = normalizedBuffer.split('\n\n');
+        sseBuffer = blocks.pop() || '';
+
+        for (const block of blocks) {
+          const lines = block.split('\n');
+          let eventName = '';
+          const dataLines: string[] = [];
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith('event:')) {
+              eventName = trimmed.substring(6).trim();
+            } else if (trimmed.startsWith('data:')) {
+              dataLines.push(trimmed.substring(5).trim());
+            }
+          }
+
+          const dataStr = dataLines.join('\n');
+
+          if (dataStr && dataStr.trim() !== '[DONE]') {
+            try {
+              const eventData = JSON.parse(dataStr);
+              const effectiveEventName = eventName || eventData.type;
+
+              if (effectiveEventName === 'response.completed') {
+                terminalStatus = 'completed';
+                const usage = eventData.response?.usage;
+                if (usage) {
+                  extractedUsage = {
+                    inputTokens: usage.input_tokens || 0,
+                    outputTokens: usage.output_tokens || 0,
+                    cachedInputTokens: usage.input_tokens_details?.cached_tokens || 0
+                  };
+                }
+              } else if (effectiveEventName === 'response.failed') {
+                terminalStatus = 'failed';
+                const usage = eventData.response?.usage;
+                if (usage) {
+                  extractedUsage = {
+                    inputTokens: usage.input_tokens || 0,
+                    outputTokens: usage.output_tokens || 0,
+                    cachedInputTokens: usage.input_tokens_details?.cached_tokens || 0
+                  };
+                }
+              } else if (effectiveEventName === 'response.incomplete') {
+                terminalStatus = 'incomplete';
+                const usage = eventData.response?.usage;
+                if (usage) {
+                  extractedUsage = {
+                    inputTokens: usage.input_tokens || 0,
+                    outputTokens: usage.output_tokens || 0,
+                    cachedInputTokens: usage.input_tokens_details?.cached_tokens || 0
+                  };
+                }
+              }
+            } catch (err) {
+              console.error('Failed to parse response.completed SSE JSON:', err);
+            }
+          }
+        }
+      },
+      finalize() {
+        let statusCode = 200;
+        if (terminalStatus === 'failed') {
+          statusCode = 500;
+        } else if (terminalStatus === 'incomplete') {
+          statusCode = 400;
+        }
+        return {
+          usage: extractedUsage,
+          statusCode
+        };
+      }
+    };
+  },
+
+  estimateUsageFallback(body: any, responseJson?: any) {
+    const promptLength = JSON.stringify(body.input || body).length;
+    const inputEst = Math.max(1, Math.round(promptLength / 4));
+    let outputEst = 100;
+
+    if (responseJson) {
+      const respLength = JSON.stringify(responseJson).length;
+      outputEst = Math.max(1, Math.round(respLength / 4));
+    }
+
+    return {
+      inputTokens: inputEst,
+      outputTokens: outputEst,
+      cachedInputTokens: 0
+    };
+  }
+};
+
+// ----------------------------------------------------
+// Shared Transport Executor
+// ----------------------------------------------------
+export async function forwardWithAdapter(
+  req: Request,
+  res: Response,
+  adapter: ProxyAdapter,
+  retryCount = 0
+): Promise<void> {
+  const startTime = Date.now();
+
+  // 1. Normalize Body & Parameter Validations
+  const normResult = adapter.normalizeBody(req.body);
+  if (!normResult.ok) {
+    res.status(normResult.status).json(normResult.error);
+    return;
+  }
+  const body = normResult.body;
+  const isStream = adapter.isStreamRequest(body);
+
+  // 2. Upstream Key Selection
   let selectedKey: SelectedKey;
   try {
     selectedKey = selectNextKey();
@@ -90,17 +373,17 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), config.requestTimeoutMs);
 
-  // Hook into client disconnection to cancel upstream request immediately
+  // Client disconnection listener
   res.on('close', () => {
     if (!res.writableEnded) {
-      console.log(`🔌 Client disconnected. Aborting upstream request on key ${selectedKey.hash.substring(0, 8)}.`);
+      console.log(`🔌 Client disconnected. Aborting upstream request for /v1${adapter.upstreamPath} on key ${selectedKey.hash.substring(0, 8)}.`);
       controller.abort();
     }
   });
 
   try {
-    const upstreamUrl = `${config.openaiBaseUrl}/chat/completions`;
-    
+    const upstreamUrl = `${config.openaiBaseUrl}${adapter.upstreamPath}`;
+
     const response = await fetch(upstreamUrl, {
       method: 'POST',
       headers: {
@@ -113,7 +396,7 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
 
     clearTimeout(timeoutId);
 
-    // 2. Handle Upstream Errors (Retryable vs Permanent)
+    // 3. Handle Upstream Errors (Retryable vs Permanent)
     if (!response.ok) {
       const errorText = await response.text();
       let errorJson: any = {};
@@ -122,18 +405,15 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
       } catch {}
 
       const errorMsg = errorJson?.error?.message || errorText || response.statusText;
-      
-      // Update key failure status in SQLite
+
       handleKeyFailure(selectedKey.hash, selectedKey.type, response.status, errorMsg);
 
-      // Attempt retry if limits permit and it's a retryable error status (429, 500, 502, 503, 504)
       const isRetryable = [429, 500, 502, 503, 504].includes(response.status);
       if (isRetryable && selectedKey.type === 'free' && retryCount < config.maxRetries) {
-        console.log(`🔄 Retryable error ${response.status}. Retrying another key... (Attempt ${retryCount + 1}/${config.maxRetries})`);
-        return forwardChatCompletions(req, res, retryCount + 1); // Recurse to try next key
+        console.log(`🔄 Retryable error ${response.status} on /v1${adapter.upstreamPath}. Retrying next key... (Attempt ${retryCount + 1}/${config.maxRetries})`);
+        return forwardWithAdapter(req, res, adapter, retryCount + 1);
       }
 
-      // Propagate the upstream error back to client
       const hasErrorStructure = errorJson && typeof errorJson === 'object' && errorJson.error;
       res.status(response.status).json(hasErrorStructure ? errorJson : {
         error: {
@@ -145,15 +425,14 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
       return;
     }
 
-    // Key succeeded! Update success state in SQLite
+    // Success: Update state
     handleKeySuccess(selectedKey.hash, selectedKey.type);
 
-    // Set custom headers to inform client about model and routing tier
-    res.setHeader('X-Proxy-Upstream-Model', body.model);
+    res.setHeader('X-Proxy-Upstream-Model', body.model || 'default');
     res.setHeader('X-Proxy-Upstream-Key-Type', selectedKey.type);
 
     if (isStream) {
-      // 3. STREAMING FLOW (SSE)
+      // --- STREAMING MODE (SSE) ---
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -164,114 +443,78 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      
-      let sseBuffer = '';
-      let promptTokens = 0;
-      let completionTokens = 0;
-      let cachedTokens = 0;
+      const streamTracker = adapter.createStreamTracker(body);
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         const chunk = decoder.decode(value, { stream: true });
-        res.write(chunk); // write chunk back to client immediately
+        res.write(chunk);
 
-        // Parse SSE chunk to extract token usage
-        sseBuffer += chunk;
-        const lines = sseBuffer.split('\n');
-        sseBuffer = lines.pop() || ''; // keep partial line in buffer
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith('data: ')) {
-            const dataStr = trimmed.substring(6).trim();
-            if (dataStr === '[DONE]') continue;
-            try {
-              const parsed = JSON.parse(dataStr);
-              if (parsed.usage) {
-                const u = parsed.usage as Usage;
-                promptTokens = u.prompt_tokens;
-                completionTokens = u.completion_tokens;
-                if (u.prompt_tokens_details?.cached_tokens) {
-                  cachedTokens = u.prompt_tokens_details.cached_tokens;
-                }
-              }
-            } catch {}
-          }
-        }
+        streamTracker.onChunk(chunk);
       }
 
-      res.end(); // finish client response
+      res.end();
 
       const latency = Date.now() - startTime;
-      const totalTokens = promptTokens + completionTokens;
+      const trackerResult = streamTracker.finalize();
+      let finalUsage = trackerResult.usage;
+      const loggedStatus = trackerResult.statusCode || 200;
 
-      // Fallback rough token estimation if upstream didn't provide usage in stream
-      let finalInputTokens = promptTokens;
-      let finalOutputTokens = completionTokens;
-      if (totalTokens === 0) {
-        const promptLength = JSON.stringify(body.messages).length;
-        finalInputTokens = Math.max(1, Math.round(promptLength / 4));
-        finalOutputTokens = 100; // conservative estimate for stream
+      if (!finalUsage) {
+        finalUsage = adapter.estimateUsageFallback(body);
       }
 
-      // Log statistics
       logRequest({
         upstreamKeyHash: selectedKey.hash,
-        model: body.model,
-        statusCode: 200,
+        model: body.model || 'default',
+        statusCode: loggedStatus,
         latencyMs: latency,
-        estimatedInputTokens: finalInputTokens,
-        estimatedOutputTokens: finalOutputTokens,
-        cachedInputTokens: cachedTokens,
+        estimatedInputTokens: finalUsage.inputTokens,
+        estimatedOutputTokens: finalUsage.outputTokens,
+        cachedInputTokens: finalUsage.cachedInputTokens,
         keyType: selectedKey.type
       });
 
-      updateDailyUsage(selectedKey.hash, finalInputTokens, finalOutputTokens, cachedTokens);
+      updateDailyUsage(selectedKey.hash, finalUsage.inputTokens, finalUsage.outputTokens, finalUsage.cachedInputTokens);
 
     } else {
-      // 4. NON-STREAMING FLOW
+      // --- NON-STREAMING MODE ---
       const responseJson = await response.json() as any;
-      res.json(responseJson); // return JSON response
+      res.json(responseJson);
 
       const latency = Date.now() - startTime;
-      let promptTokens = responseJson.usage?.prompt_tokens;
-      let completionTokens = responseJson.usage?.completion_tokens;
-      let cachedTokens = responseJson.usage?.prompt_tokens_details?.cached_tokens || 0;
+      const result = adapter.extractUsageFromJson(body, responseJson);
+      let finalUsage = result.usage;
+      const loggedStatus = result.statusCode || 200;
 
-      // Fallback estimation
-      if (promptTokens === undefined) {
-        const promptLength = JSON.stringify(body.messages).length;
-        const respLength = JSON.stringify(responseJson).length;
-        promptTokens = Math.max(1, Math.round(promptLength / 4));
-        completionTokens = Math.max(1, Math.round(respLength / 4));
+      if (!finalUsage) {
+        finalUsage = adapter.estimateUsageFallback(body, responseJson);
       }
 
-      // Log statistics
       logRequest({
         upstreamKeyHash: selectedKey.hash,
-        model: body.model,
-        statusCode: 200,
+        model: body.model || 'default',
+        statusCode: loggedStatus,
         latencyMs: latency,
-        estimatedInputTokens: promptTokens,
-        estimatedOutputTokens: completionTokens,
-        cachedInputTokens: cachedTokens,
+        estimatedInputTokens: finalUsage.inputTokens,
+        estimatedOutputTokens: finalUsage.outputTokens,
+        cachedInputTokens: finalUsage.cachedInputTokens,
         keyType: selectedKey.type
       });
 
-      updateDailyUsage(selectedKey.hash, promptTokens || 0, completionTokens || 0, cachedTokens);
+      updateDailyUsage(selectedKey.hash, finalUsage.inputTokens, finalUsage.outputTokens, finalUsage.cachedInputTokens);
     }
 
   } catch (error: any) {
     clearTimeout(timeoutId);
-    
-    // Check if it was an aborted request
+
     const isAbort = error.name === 'AbortError';
     const status = isAbort ? 499 : 500;
     const msg = isAbort ? 'Client Aborted Request or Connection Timeout' : error.message;
 
-    console.error(`❌ Request failed on key ${selectedKey.hash.substring(0, 8)}:`, msg);
+    console.error(`❌ Request failed on key ${selectedKey.hash.substring(0, 8)} for /v1${adapter.upstreamPath}:`, msg);
 
     if (!isAbort) {
       handleKeyFailure(selectedKey.hash, selectedKey.type, 500, error.message);
@@ -287,4 +530,15 @@ export async function forwardChatCompletions(req: Request, res: Response, retryC
       });
     }
   }
+}
+
+// ----------------------------------------------------
+// Public Entry Wrappers
+// ----------------------------------------------------
+export async function forwardChatCompletions(req: Request, res: Response): Promise<void> {
+  return forwardWithAdapter(req, res, chatAdapter);
+}
+
+export async function forwardResponses(req: Request, res: Response): Promise<void> {
+  return forwardWithAdapter(req, res, responsesAdapter);
 }

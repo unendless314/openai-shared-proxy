@@ -2,6 +2,7 @@ import { spawn, ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import express from 'express';
+import Database from 'better-sqlite3';
 
 // Interfaces for our test runner
 interface TestState {
@@ -78,6 +79,108 @@ mockApp.post('/v1/chat/completions', (req, res) => {
         prompt_tokens: 10,
         completion_tokens: 5,
         total_tokens: 15
+      }
+    });
+  }
+});
+
+mockApp.post('/v1/responses', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const key = authHeader.replace('Bearer ', '').trim();
+  
+  // Track requests per key
+  state.requestCounts[key] = (state.requestCounts[key] || 0) + 1;
+  console.log(`[Mock Upstream] Received /responses request on key: ${key.substring(0, 15)}... (Request #${state.requestCounts[key]})`);
+
+  // Verify parameter normalization assertions
+  if (req.body.max_tokens !== undefined) {
+    console.error('❌ [Mock Server Assertion Failed] max_tokens was not removed!');
+    res.status(400).json({ error: { message: 'Upstream received raw max_tokens parameters. Normalization failed.' } });
+    return;
+  }
+  // In TEST 7 and TEST 7a, max_tokens: 100 is sent, which should be normalized to max_output_tokens: 100
+  if ((req.body.model === 'gpt-4o' && req.body.stream !== true) || req.body.model === 'responses-fail-nonstream') {
+    if (req.body.max_output_tokens === undefined) {
+      console.error('❌ [Mock Server Assertion Failed] max_output_tokens is missing for normalized request!');
+      res.status(400).json({ error: { message: 'Upstream did not receive max_output_tokens parameter. Mapping failed.' } });
+      return;
+    }
+    if (req.body.max_output_tokens !== 100) {
+      console.error(`❌ [Mock Server Assertion Failed] max_output_tokens value was wrong: ${req.body.max_output_tokens}!`);
+      res.status(400).json({ error: { message: 'Upstream received wrong max_output_tokens value.' } });
+      return;
+    }
+    console.log('✅ [Mock Server Assertion Passed] max_output_tokens normalized successfully.');
+  }
+
+  // Simulate failures if state.mockErrorStatus is set
+  if (state.mockErrorStatus) {
+    console.log(`[Mock Upstream] Simulating responses failure: HTTP ${state.mockErrorStatus}`);
+    res.status(state.mockErrorStatus).json({
+      error: {
+        message: state.mockErrorText,
+        type: 'mock_error',
+        code: 'mock_failure'
+      }
+    });
+    return;
+  }
+
+  const isStream = req.body.stream === true;
+  
+  if (isStream) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    if (req.body.model === 'responses-fail-stream') {
+      // Mock stream failure event (Finding 1 validation)
+      res.write('event: response.created\r\ndata: {"id":"resp-test"}\r\n\r\n');
+      res.write('event: response.failed\r\ndata: {"id":"resp-test","type":"response.failed","response":{"status":{"error":{"message":"Mock Agent Failure"}},"usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":2}}}}\r\n\r\n');
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+
+    // Send event blocks with varying event and type headers, CRLF, and LF variations
+    res.write('event: response.created\r\ndata: {"id":"resp-test"}\r\n\r\n');
+    res.write('event: response.delta\ndata: {"id":"resp-test","delta":{"content":"Hi"}}\n\n');
+    // Test event block with response.completed event carrying usage and cached token info
+    res.write('event: response.completed\r\ndata: {"id":"resp-test","type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":6,"input_tokens_details":{"cached_tokens":4}}}}\r\n\r\n');
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } else {
+    if (req.body.model === 'responses-fail-nonstream') {
+      // Mock semantic failure for non-streaming Responses API (Finding 1 validation)
+      res.json({
+        id: 'resp-test',
+        object: 'response',
+        status: 'failed',
+        created: Math.floor(Date.now() / 1000),
+        model: 'responses-fail-nonstream',
+        usage: {
+          input_tokens: 8,
+          output_tokens: 2,
+          input_tokens_details: {
+            cached_tokens: 1
+          }
+        }
+      });
+      return;
+    }
+
+    // Return standard responses json body with mapped token details and cached input details
+    res.json({
+      id: 'resp-test',
+      object: 'response',
+      created: Math.floor(Date.now() / 1000),
+      model: req.body.model || 'gpt-4o',
+      usage: {
+        input_tokens: 12,
+        output_tokens: 6,
+        input_tokens_details: {
+          cached_tokens: 4
+        }
       }
     });
   }
@@ -353,6 +456,200 @@ async function runTests() {
     const keyTypeHeader = fallbackResp.headers.get('X-Proxy-Upstream-Key-Type');
     console.log(`Routing Tier: ${keyTypeHeader} (Expected: master)`);
     if (keyTypeHeader !== 'master') throw new Error('Failed to fallback to Paid Master Key');
+
+    console.log('\n--- 🧪 TEST 7: Responses API Non-Streaming Call ---');
+    const resp1 = await fetch('http://127.0.0.1:3001/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer test-proxy-token'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        max_tokens: 100 // Test max_tokens -> max_output_tokens normalization!
+      })
+    });
+    console.log(`Status code: ${resp1.status} (Expected: 200)`);
+    if (resp1.status !== 200) throw new Error('Responses non-stream request failed');
+    const resp1Json = await resp1.json() as any;
+    console.log(`Usage returned:`, JSON.stringify(resp1Json.usage));
+    if (resp1Json.usage?.input_tokens !== 12 || resp1Json.usage?.output_tokens !== 6) {
+      throw new Error('Responses usage returned does not match expected upstream values!');
+    }
+    if (resp1Json.usage?.input_tokens_details?.cached_tokens !== 4) {
+      throw new Error('Responses cached tokens returned does not match expected values!');
+    }
+
+    console.log('\n--- 🧪 TEST 7a: Responses API Failed Non-Streaming Call & Observable Status ---');
+    const respFailNonStream = await fetch('http://127.0.0.1:3001/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer test-proxy-token'
+      },
+      body: JSON.stringify({
+        model: 'responses-fail-nonstream',
+        max_tokens: 100
+      })
+    });
+    console.log(`Status code: ${respFailNonStream.status} (Expected: 200)`);
+    if (respFailNonStream.status !== 200) throw new Error('Responses fail non-stream request failed');
+    const respFailNonStreamJson = await respFailNonStream.json() as any;
+    console.log(`Semantic status:`, respFailNonStreamJson.status);
+    if (respFailNonStreamJson.status !== 'failed') {
+      throw new Error('Expected status to be failed!');
+    }
+    
+    // Wait a tiny bit for DB update
+    await sleep(200);
+
+    // Verify key status in Dashboard API (should NOT be disabled or cooled down under Option A)
+    const adminCheckRespFailNS = await fetch('http://127.0.0.1:3001/api/status', {
+      headers: { 'Authorization': `Basic ${basicAuth}` }
+    });
+    const checkDataFailNS = await adminCheckRespFailNS.json() as any;
+    const masterKeyNS = checkDataFailNS.upstreamKeys.find((k: any) => k.label === 'sha256:da89830a');
+    console.log(`Paid Master Key - Healthy: ${masterKeyNS.healthy}, Cooldown: ${masterKeyNS.cooldownUntil !== null}`);
+    if (!masterKeyNS.healthy || masterKeyNS.cooldownUntil !== null) {
+      throw new Error('Key was mistakenly penalized under Option A for a non-stream agent failure!');
+    }
+    console.log('✅ Verified: Key remains healthy and is NOT penalized (Option A verified for non-streaming).');
+
+    console.log('\n--- 🧪 TEST 8: Responses API Streaming Call & SSE Block Parser ---');
+    const respStream = await fetch('http://127.0.0.1:3001/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer test-proxy-token'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        stream: true
+      })
+    });
+    console.log(`Status code: ${respStream.status} (Expected: 200)`);
+    if (respStream.status !== 200) throw new Error('Responses stream request failed');
+    
+    const respReader = respStream.body?.getReader();
+    const respDecoder = new TextDecoder();
+    let respStreamText = '';
+    while (true) {
+      const { done, value } = await respReader!.read();
+      if (done) break;
+      respStreamText += respDecoder.decode(value, { stream: true });
+    }
+    console.log(`Stream complete. Output includes response.completed: ${respStreamText.includes('response.completed')}`);
+    if (!respStreamText.includes('response.completed')) throw new Error('Responses stream did not contain completed event data');
+
+    console.log('\n--- 🧪 TEST 8a: Responses API Failed Streaming Call & Observable Status ---');
+    const respFailStream = await fetch('http://127.0.0.1:3001/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer test-proxy-token'
+      },
+      body: JSON.stringify({
+        model: 'responses-fail-stream',
+        stream: true
+      })
+    });
+    console.log(`Status code: ${respFailStream.status} (Expected: 200)`);
+    if (respFailStream.status !== 200) throw new Error('Responses fail stream request failed to establish initial connection');
+    
+    const respFailReader = respFailStream.body?.getReader();
+    const respFailDecoder = new TextDecoder();
+    let respFailStreamText = '';
+    while (true) {
+      const { done, value } = await respFailReader!.read();
+      if (done) break;
+      respFailStreamText += respFailDecoder.decode(value, { stream: true });
+    }
+    console.log(`Stream complete. Output includes response.failed: ${respFailStreamText.includes('response.failed')}`);
+    if (!respFailStreamText.includes('response.failed')) throw new Error('Responses fail stream did not contain failed event data');
+
+    // Wait a tiny bit for DB update
+    await sleep(200);
+
+    // Verify key status in Dashboard API (should NOT be disabled or cooled down under Option A)
+    const adminCheckRespFail = await fetch('http://127.0.0.1:3001/api/status', {
+      headers: { 'Authorization': `Basic ${basicAuth}` }
+    });
+    const checkDataFail = await adminCheckRespFail.json() as any;
+    const masterKey = checkDataFail.upstreamKeys.find((k: any) => k.label === 'sha256:da89830a');
+    console.log(`Paid Master Key - Healthy: ${masterKey.healthy}, Cooldown: ${masterKey.cooldownUntil !== null}, Disabled: ${masterKey.isDisabled}`);
+    if (!masterKey.healthy || masterKey.isDisabled || masterKey.cooldownUntil !== null) {
+      throw new Error('Key was mistakenly penalized under Option A for an agent stream failure!');
+    }
+    console.log('✅ Verified: Key remains healthy and is NOT penalized (Option A verified).');
+
+    console.log('\n--- 🧪 TEST 9: Responses API Ambiguous Parameter Validation ---');
+    const badParamResp = await fetch('http://127.0.0.1:3001/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer test-proxy-token'
+      },
+      body: JSON.stringify({
+        max_tokens: 100,
+        max_output_tokens: 100
+      })
+    });
+    console.log(`Ambiguity check status code: ${badParamResp.status} (Expected: 400)`);
+    if (badParamResp.status !== 400) throw new Error('Proxy did not reject ambiguous parameters with 400!');
+    const badParamJson = await badParamResp.json() as any;
+    console.log(`Response error message: ${badParamJson.error?.message}`);
+
+    console.log('\n--- 🧪 TEST 10: Responses API SQLite Accounting & Cached Tokens Verification ---');
+    // Fetch status check to see if SQLite has recorded the correct statistics
+    const adminCheckResp2 = await fetch('http://127.0.0.1:3001/api/status', {
+      headers: { 'Authorization': `Basic ${basicAuth}` }
+    });
+    const statusData = await adminCheckResp2.json() as any;
+    console.log(`SQLite usageEstimate:`, JSON.stringify(statusData.usageEstimate));
+    
+    // We expect:
+    // Responses API non-streaming (success): 4 cached tokens
+    // Responses API non-streaming (failed): 1 cached token
+    // Responses API streaming (success): 4 cached tokens
+    // Responses API streaming (failed): 2 cached tokens
+    // Total cached tokens in SQLite: 11 cached tokens!
+    if (statusData.usageEstimate.cachedTokens === undefined) {
+      throw new Error('SQLite status did not aggregate cached tokens!');
+    }
+    console.log(`SQLite total cached tokens: ${statusData.usageEstimate.cachedTokens} (Expected: 11)`);
+    if (statusData.usageEstimate.cachedTokens !== 11) {
+      throw new Error(`Cached tokens mismatch in database! Expected 11, got ${statusData.usageEstimate.cachedTokens}`);
+    }
+    console.log(`✅ SQLite usage accounting and cached tokens verified successfully!`);
+
+    // Verify semantic failures were persisted with observable non-200 status codes in request_log.
+    const db = new Database(dbPath, { readonly: true });
+    const loggedFailedNonStream = db.prepare(`
+      SELECT status_code
+      FROM request_log
+      WHERE model = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `).get('responses-fail-nonstream') as { status_code: number } | undefined;
+    const loggedFailedStream = db.prepare(`
+      SELECT status_code
+      FROM request_log
+      WHERE model = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `).get('responses-fail-stream') as { status_code: number } | undefined;
+    db.close();
+
+    console.log(`Logged non-stream semantic failure status: ${loggedFailedNonStream?.status_code} (Expected: 500)`);
+    if (loggedFailedNonStream?.status_code !== 500) {
+      throw new Error(`Expected request_log status_code 500 for responses-fail-nonstream, got ${loggedFailedNonStream?.status_code}`);
+    }
+
+    console.log(`Logged stream semantic failure status: ${loggedFailedStream?.status_code} (Expected: 500)`);
+    if (loggedFailedStream?.status_code !== 500) {
+      throw new Error(`Expected request_log status_code 500 for responses-fail-stream, got ${loggedFailedStream?.status_code}`);
+    }
+    console.log('✅ Verified semantic failure status codes were persisted correctly in request_log.');
 
     console.log('\n✅ ALL INTEGRATION TESTS PASSED SUCCESSFULLY! 🎉');
 

@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { config } from './config.js';
 import { initDb, getApiStatusDetails } from './db.js';
-import { forwardChatCompletions } from './openai.js';
+import { forwardChatCompletions, forwardResponses } from './openai.js';
 import { selectNextKey } from './router.js';
 import { renderDashboard } from './dashboard.js';
 
@@ -87,6 +87,10 @@ app.get('/health', (req: Request, res: Response) => {
 
 app.post('/v1/chat/completions', authenticateClient, (req: Request, res: Response) => {
   forwardChatCompletions(req, res);
+});
+
+app.post('/v1/responses', authenticateClient, (req: Request, res: Response) => {
+  forwardResponses(req, res);
 });
 
 app.get('/v1/models', authenticateClient, async (req: Request, res: Response) => {

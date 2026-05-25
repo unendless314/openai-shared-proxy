@@ -8,39 +8,40 @@ This document outlines the implementation strategy for building `openai-shared-p
 
 Create a cloud-friendly proxy server for OpenAI-compatible clients such as Codex, OpenCode, VS Code extensions, and custom scripts.
 
-Scope for the first version:
+Scope for the current first version:
 - All traffic is treated as `shared`.
 - The proxy forwards requests to a single shared OpenAI org/project policy domain.
 - The proxy may support one or more upstream keys only when they belong to the same intended routing policy.
 - The proxy provides a minimal web status page for health, request counts, and estimated usage visibility.
+- The proxy supports `POST /v1/chat/completions` and `POST /v1/responses` as the two primary client-facing generation endpoints.
 
-Explicitly out of scope for v1:
+Explicitly out of scope for the current v1:
 - Private/shared split routing.
 - Cross-org quota pooling or complimentary-token aggregation.
 - Automatic content classification.
 - Multi-tenant user billing.
+- `GET /v1/responses/:response_id`, `DELETE /v1/responses/:response_id`, `POST /v1/responses/:response_id/cancel`.
+- Conversations API proxying.
 
 ---
 
 ## 2. Proposed Changes
 
-We will create a new directory `openai-shared-proxy` within `/Users/linchunchiao/Documents/OpenRouter`.
+The project already exists in the current repository. The implementation focus is on evolving the existing codebase rather than creating a new project tree.
 
 ```text
-/Users/linchunchiao/Documents/OpenRouter/
-  ├── litellm/
-  ├── freellmapi/
-  └── openai-shared-proxy/ [NEW]
-        ├── package.json
-        ├── tsconfig.json
-        ├── .env.example
-        └── src/
-             ├── index.ts      # Express app, auth, API routes, dashboard routes
-             ├── config.ts     # Env parsing and upstream configuration
-             ├── db.ts         # SQLite schema for request logs and key health
-             ├── router.ts     # Upstream key selection and retry policy
-             ├── openai.ts     # Upstream forwarding and streaming helpers
-             └── dashboard.ts  # Static HTML dashboard template
+/Users/linchunchiao/Documents/openai-shared-proxy/
+  ├── package.json
+  ├── tsconfig.json
+  ├── .env.example
+  ├── docs/
+  └── src/
+       ├── index.ts      # Express app, auth, API routes, dashboard routes
+       ├── config.ts     # Env parsing and upstream configuration
+       ├── db.ts         # SQLite schema for request logs and key health
+       ├── router.ts     # Upstream key selection and retry policy
+       ├── openai.ts     # Shared executor + endpoint adapters
+       └── dashboard.ts  # Static HTML dashboard template
 ```
 
 ---
@@ -86,6 +87,7 @@ Tables:
   - `latency_ms`
   - `estimated_input_tokens`
   - `estimated_output_tokens`
+  - `cached_input_tokens`
   - `key_type`                # 'free' | 'master'
 - `upstream_key_state`
   - `key_hash`
@@ -94,11 +96,15 @@ Tables:
   - `exhausted_until`         # UTC midnight timestamp when the daily limit resets
   - `last_error`
   - `last_success_at`
+  - `is_disabled`
 - `daily_usage_estimate`
   - `date_utc`                # 'YYYY-MM-DD'
   - `upstream_key_hash`
   - `requests_count`
   - `tokens_estimated`
+  - `input_tokens_estimated`
+  - `output_tokens_estimated`
+  - `cached_tokens_estimated`
 
 This database tracks key health and daily usage to inform routing decisions. It is for routing optimization and is not the official financial billing source.
 
@@ -112,7 +118,7 @@ The router implements a two-tier cost-optimized path:
    - Filter `OPENAI_SHARED_KEYS`.
    - Skip keys currently on cooldown or marked unhealthy.
    - Skip keys where SQLite `daily_usage_estimate` for the current UTC day exceeds `KEY_DAILY_TOKEN_LIMIT` or `KEY_DAILY_REQ_LIMIT`.
-   - Pick the next eligible free key using round-robin.
+   - Pick the next eligible free key using the proxy's deterministic selection order, while preserving failover to the next healthy key on retryable errors.
 2. **Tier 2 (Paid Master Key Fallback)**:
    - If no healthy, under-limit free key is available, check if `OPENAI_MASTER_KEY` is configured and healthy.
    - Route request to `OPENAI_MASTER_KEY` to guarantee uninterrupted service.
@@ -128,15 +134,19 @@ This file isolates cost optimization logic within the router tier and avoids com
 
 Handles upstream HTTP behavior:
 - Forward `POST /v1/chat/completions`
-- Forward `POST /v1/responses` if needed later
+- Forward `POST /v1/responses`
 - Stream SSE responses without buffering the full body
 - On stream completion, record final estimated/actual usage in SQLite
 - Normalize common upstream errors into OpenAI-compatible JSON responses
-- Normalize token-limit parameters for compatibility:
+- Use a shared transport executor plus per-endpoint adapters to avoid logic drift
+- Normalize token-limit parameters by API family:
   - prefer `max_completion_tokens` for Chat Completions
-  - optionally map legacy `max_tokens` to `max_completion_tokens`
-  - reserve `max_output_tokens` for any future Responses API support
-- Surface response metadata such as upstream model, key type ('free' or 'master'), and key hash label in response headers (`X-Proxy-Upstream-Key-Type`, `X-Proxy-Upstream-Model`)
+  - map legacy `max_tokens` to `max_completion_tokens` for Chat when safe
+  - use `max_output_tokens` for Responses
+  - reject ambiguous token-limit combinations with a `400`
+- Parse Responses usage using `input_tokens`, `output_tokens`, and `input_tokens_details.cached_tokens`
+- Parse Responses streaming usage from semantic completion events such as `response.completed`
+- Surface response metadata such as upstream model, key type (`free` or `master`), and retry count in response headers (`X-Proxy-Upstream-Key-Type`, `X-Proxy-Upstream-Model`, `X-Proxy-Retry-Count`)
 
 ### `dashboard.ts`
 
@@ -156,6 +166,7 @@ The dashboard should use basic auth or an authenticated session, not query-strin
 
 Exposes:
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 - `GET /v1/models`
 - `GET /health`
 - `GET /status`
@@ -183,19 +194,22 @@ This avoids presenting local ledger data as billing truth.
 We will create `test_proxy.ts` or a small test suite to verify:
 
 1. Valid proxy bearer token is required for API requests.
-2. Requests are forwarded correctly to the configured OpenAI-compatible endpoint.
-3. Streaming responses pass through without corruption.
-4. A `429` or timeout on upstream key 1 causes retry on upstream key 2.
-5. Invalid upstream credentials mark that key unhealthy.
-6. Admin dashboard requires authentication.
-7. `/api/status` returns expected health and estimate fields.
+2. `POST /v1/chat/completions` non-stream requests are forwarded correctly.
+3. `POST /v1/chat/completions` stream responses pass through without corruption.
+4. `POST /v1/responses` non-stream requests are forwarded correctly.
+5. `POST /v1/responses` stream responses pass through without corruption.
+6. Responses usage is mapped into SQLite with input, output, and cached token accounting.
+7. A `429` or timeout on upstream key 1 causes retry on upstream key 2.
+8. Invalid upstream credentials mark that key unhealthy.
+9. Admin dashboard requires authentication.
+10. `/api/status` returns expected health and estimate fields.
 
 ---
 
 ## 6. Future Extensions
 
 Possible later phases, intentionally deferred from v1:
-- Optional `responses` API support.
+- Additional Responses family endpoints beyond `POST /v1/responses`.
 - Official usage API reconciliation.
 - Per-project profiles for manually selected routing modes.
 - Separate private route with strict no-cache behavior.
